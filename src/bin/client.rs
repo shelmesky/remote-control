@@ -1,23 +1,30 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(not(target_os = "windows"))]
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_os = "windows"))]
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use eframe::egui;
 use jpeg_encoder::{ColorType, Encoder};
+#[cfg(not(target_os = "windows"))]
 use remote_control::config::TARGET_FPS;
 use remote_control::protocol::{ClientHello, write_frame, write_hello};
 use remote_control::ui_fonts::install_cjk_font;
+#[cfg(not(target_os = "windows"))]
 use scrap::{Capturer, Display};
 
 #[cfg(target_os = "windows")]
 use windows_capture::capture::{Context as WgcContext, GraphicsCaptureApiHandler};
+#[cfg(target_os = "windows")]
+use windows_capture::graphics_capture_api::InternalCaptureControl;
 #[cfg(target_os = "windows")]
 use windows_capture::monitor::Monitor;
 #[cfg(target_os = "windows")]
@@ -30,7 +37,7 @@ use winreg::RegKey;
 #[cfg(target_os = "windows")]
 use winreg::enums::HKEY_CURRENT_USER;
 
-const SERVER_ADDR: &str = "127.0.0.1:5000";
+const SERVER_ADDR: &str = "172.20.20.8:5000";
 const JPEG_QUALITY: u8 = 70;
 
 fn main() -> eframe::Result<()> {
@@ -256,7 +263,7 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
         fn on_frame_arrived(
             &mut self,
             frame: &mut windows_capture::frame::Frame,
-            capture_control: windows_capture::capture::InternalCaptureControl,
+            capture_control: InternalCaptureControl,
         ) -> std::result::Result<(), Self::Error> {
             if self.stop.load(Ordering::Relaxed) {
                 let _ = capture_control.stop();
@@ -280,7 +287,7 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
         CursorCaptureSettings::Default,
         DrawBorderSettings::Default,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Milliseconds((1000 / TARGET_FPS).max(1) as i32),
+        MinimumUpdateIntervalSettings::Default,
         DirtyRegionSettings::Default,
         ColorFormat::Rgba8,
         WgcFlags {
@@ -363,6 +370,7 @@ fn encode_jpeg_rgba_reuse(
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn encode_jpeg_bgra_reuse(
     frame: &[u8],
     width: usize,
