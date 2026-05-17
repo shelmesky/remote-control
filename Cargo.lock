@@ -2569,6 +2569,7 @@ dependencies = [
  "image",
  "jpeg-encoder",
  "scrap",
+ "windows-sys 0.60.2",
  "winreg",
 ]
 

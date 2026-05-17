@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use jpeg_encoder::{ColorType, Encoder};
 use remote_control::config::{CLIENT_SERVER_ADDR, TARGET_FPS};
+use remote_control::platform::enable_dpi_awareness;
 use remote_control::protocol::{ClientHello, write_frame, write_hello};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind;
@@ -22,6 +23,7 @@ const SCALE_DIVISOR: usize = 2;
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 fn main() {
+    enable_dpi_awareness();
     let _ = set_autostart_enabled();
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -83,18 +85,18 @@ fn encode_jpeg_bgra_reuse(
     rgb_buf: &mut Vec<u8>,
     jpeg_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let stride = frame.len() / height;
-    if stride < width * 4 {
+    let (source_width, source_height, stride) = frame_geometry(frame.len(), width, height)?;
+    if stride < source_width * 4 {
         bail!("unexpected frame stride");
     }
 
-    let encoded_width = width.div_ceil(SCALE_DIVISOR);
-    let encoded_height = height.div_ceil(SCALE_DIVISOR);
+    let encoded_width = source_width.div_ceil(SCALE_DIVISOR);
+    let encoded_height = source_height.div_ceil(SCALE_DIVISOR);
     rgb_buf.clear();
     rgb_buf.reserve(encoded_width * encoded_height * 3);
-    for y in (0..height).step_by(SCALE_DIVISOR) {
-        let row = &frame[y * stride..(y * stride + width * 4)];
-        for x in (0..width).step_by(SCALE_DIVISOR) {
+    for y in (0..source_height).step_by(SCALE_DIVISOR) {
+        let row = &frame[y * stride..(y * stride + source_width * 4)];
+        for x in (0..source_width).step_by(SCALE_DIVISOR) {
             let offset = x * 4;
             rgb_buf.extend_from_slice(&[row[offset + 2], row[offset + 1], row[offset]]);
         }
@@ -109,6 +111,34 @@ fn encode_jpeg_bgra_reuse(
         ColorType::Rgb,
     )?;
     Ok(())
+}
+
+fn frame_geometry(
+    frame_len: usize,
+    display_width: usize,
+    display_height: usize,
+) -> Result<(usize, usize, usize)> {
+    if display_width == 0 || display_height == 0 {
+        bail!("invalid screen size");
+    }
+
+    let nominal_bytes = display_width * display_height * 4;
+    if frame_len >= nominal_bytes {
+        let scale = (frame_len as f64 / nominal_bytes as f64).sqrt();
+        if scale > 1.05 {
+            let scaled_width = (display_width as f64 * scale).round() as usize;
+            let scaled_height = (display_height as f64 * scale).round() as usize;
+            if scaled_width > display_width
+                && scaled_height > display_height
+                && scaled_height > 0
+                && frame_len / scaled_height >= scaled_width * 4
+            {
+                return Ok((scaled_width, scaled_height, frame_len / scaled_height));
+            }
+        }
+    }
+
+    Ok((display_width, display_height, frame_len / display_height))
 }
 
 fn client_name() -> String {
