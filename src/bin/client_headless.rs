@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use jpeg_encoder::{ColorType, Encoder};
 use remote_control::config::{CLIENT_SERVER_ADDR, TARGET_FPS};
-use remote_control::platform::enable_dpi_awareness;
+use remote_control::platform::{cursor_position, enable_dpi_awareness};
 use remote_control::protocol::{ClientHello, write_frame, write_hello};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind;
@@ -51,8 +51,9 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
     let width = capturer.width();
     let height = capturer.height();
     let frame_interval = Duration::from_millis((1000 / TARGET_FPS).max(1));
-    let mut rgb_buf = vec![0_u8; width * height * 3 / (SCALE_DIVISOR * SCALE_DIVISOR)];
-    let mut jpeg_buf = Vec::with_capacity(width * height / 8);
+    let encoded_pixels = width.div_ceil(SCALE_DIVISOR) * height.div_ceil(SCALE_DIVISOR);
+    let mut rgb_buf = Vec::with_capacity(encoded_pixels * 3);
+    let mut jpeg_buf = Vec::with_capacity(encoded_pixels / 2);
 
     while !stop.load(Ordering::Relaxed) {
         let tick = Instant::now();
@@ -101,6 +102,7 @@ fn encode_jpeg_bgra_reuse(
             rgb_buf.extend_from_slice(&[row[offset + 2], row[offset + 1], row[offset]]);
         }
     }
+    overlay_cursor(rgb_buf, encoded_width, encoded_height);
 
     jpeg_buf.clear();
     let encoder = Encoder::new(jpeg_buf, JPEG_QUALITY);
@@ -111,6 +113,39 @@ fn encode_jpeg_bgra_reuse(
         ColorType::Rgb,
     )?;
     Ok(())
+}
+
+fn overlay_cursor(rgb: &mut [u8], width: usize, height: usize) {
+    let Some(cursor) = cursor_position() else {
+        return;
+    };
+    let x = cursor.x.div_euclid(SCALE_DIVISOR as i32);
+    let y = cursor.y.div_euclid(SCALE_DIVISOR as i32);
+    draw_cursor_pixel(rgb, width, height, x, y, [255, 255, 255]);
+    draw_cursor_pixel(rgb, width, height, x + 1, y, [0, 0, 0]);
+    draw_cursor_pixel(rgb, width, height, x, y + 1, [0, 0, 0]);
+    for i in 0..18 {
+        let dx = i / 2;
+        draw_cursor_pixel(rgb, width, height, x + dx, y + i, [255, 255, 255]);
+        draw_cursor_pixel(rgb, width, height, x + dx + 1, y + i, [0, 0, 0]);
+    }
+    for i in 0..10 {
+        draw_cursor_pixel(rgb, width, height, x + i, y + i + 10, [255, 255, 255]);
+        draw_cursor_pixel(rgb, width, height, x + i + 1, y + i + 10, [0, 0, 0]);
+    }
+}
+
+fn draw_cursor_pixel(rgb: &mut [u8], width: usize, height: usize, x: i32, y: i32, color: [u8; 3]) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let x = x as usize;
+    let y = y as usize;
+    if x >= width || y >= height {
+        return;
+    }
+    let offset = (y * width + x) * 3;
+    rgb[offset..offset + 3].copy_from_slice(&color);
 }
 
 fn frame_geometry(
