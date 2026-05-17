@@ -1,0 +1,20 @@
+name: Server Cross-Platform Check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check-server:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo check server
+        run: cargo check --bin server
