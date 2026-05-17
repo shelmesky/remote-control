@@ -1,5 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use anyhow::{Context, Result, bail};
+use eframe::egui;
+use jpeg_encoder::{ColorType, Encoder};
+use remote_control::config::TARGET_FPS;
+use remote_control::protocol::{ClientHello, write_frame, write_hello};
+use remote_control::ui_fonts::install_cjk_font;
+#[cfg(not(target_os = "windows"))]
+use scrap::{Capturer, Display};
 #[cfg(not(target_os = "windows"))]
 use std::io::ErrorKind;
 use std::net::TcpStream;
@@ -8,18 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-#[cfg(not(target_os = "windows"))]
 use std::time::Instant;
-
-use anyhow::{Context, Result, bail};
-use eframe::egui;
-use jpeg_encoder::{ColorType, Encoder};
-#[cfg(not(target_os = "windows"))]
-use remote_control::config::TARGET_FPS;
-use remote_control::protocol::{ClientHello, write_frame, write_hello};
-use remote_control::ui_fonts::install_cjk_font;
-#[cfg(not(target_os = "windows"))]
-use scrap::{Capturer, Display};
 
 #[cfg(target_os = "windows")]
 use windows_capture::capture::{Context as WgcContext, GraphicsCaptureApiHandler};
@@ -38,7 +35,8 @@ use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
 const SERVER_ADDR: &str = "172.20.20.8:5000";
-const JPEG_QUALITY: u8 = 70;
+const JPEG_QUALITY: u8 = 45;
+const SCALE_DIVISOR: usize = 2;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
@@ -231,6 +229,8 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
     struct WgcHandler {
         stop: Arc<AtomicBool>,
         stream: TcpStream,
+        frame_interval: Duration,
+        last_frame_sent: Instant,
         rgb_buf: Vec<u8>,
         jpeg_buf: Vec<u8>,
         rgba_nopad: Vec<u8>,
@@ -254,6 +254,8 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
             Ok(Self {
                 stop: ctx.flags.stop,
                 stream,
+                frame_interval: Duration::from_millis((1000 / TARGET_FPS).max(1)),
+                last_frame_sent: Instant::now() - Duration::from_secs(1),
                 rgb_buf: Vec::new(),
                 jpeg_buf: Vec::new(),
                 rgba_nopad: Vec::new(),
@@ -269,6 +271,12 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
                 let _ = capture_control.stop();
                 return Ok(());
             }
+
+            let now = Instant::now();
+            if now.duration_since(self.last_frame_sent) < self.frame_interval {
+                return Ok(());
+            }
+            self.last_frame_sent = now;
 
             let frame_buffer = frame.buffer()?;
             let width = frame_buffer.width() as usize;
@@ -358,15 +366,26 @@ fn encode_jpeg_rgba_reuse(
         bail!("invalid rgba frame size");
     }
 
+    let encoded_width = width.div_ceil(SCALE_DIVISOR);
+    let encoded_height = height.div_ceil(SCALE_DIVISOR);
     rgb_buf.clear();
-    rgb_buf.reserve(width * height * 3);
-    for px in rgba.chunks_exact(4) {
-        rgb_buf.extend_from_slice(&[px[0], px[1], px[2]]);
+    rgb_buf.reserve(encoded_width * encoded_height * 3);
+    for y in (0..height).step_by(SCALE_DIVISOR) {
+        let row_start = y * width * 4;
+        for x in (0..width).step_by(SCALE_DIVISOR) {
+            let offset = row_start + x * 4;
+            rgb_buf.extend_from_slice(&[rgba[offset], rgba[offset + 1], rgba[offset + 2]]);
+        }
     }
 
     jpeg_buf.clear();
     let encoder = Encoder::new(jpeg_buf, JPEG_QUALITY);
-    encoder.encode(rgb_buf, width as u16, height as u16, ColorType::Rgb)?;
+    encoder.encode(
+        rgb_buf,
+        encoded_width as u16,
+        encoded_height as u16,
+        ColorType::Rgb,
+    )?;
     Ok(())
 }
 
@@ -386,18 +405,26 @@ fn encode_jpeg_bgra_reuse(
         bail!("unexpected frame stride");
     }
 
+    let encoded_width = width.div_ceil(SCALE_DIVISOR);
+    let encoded_height = height.div_ceil(SCALE_DIVISOR);
     rgb_buf.clear();
-    rgb_buf.reserve(width * height * 3);
-    for y in 0..height {
+    rgb_buf.reserve(encoded_width * encoded_height * 3);
+    for y in (0..height).step_by(SCALE_DIVISOR) {
         let row = &frame[y * stride..(y * stride + width * 4)];
-        for px in row.chunks_exact(4) {
-            rgb_buf.extend_from_slice(&[px[2], px[1], px[0]]);
+        for x in (0..width).step_by(SCALE_DIVISOR) {
+            let offset = x * 4;
+            rgb_buf.extend_from_slice(&[row[offset + 2], row[offset + 1], row[offset]]);
         }
     }
 
     jpeg_buf.clear();
     let encoder = Encoder::new(jpeg_buf, JPEG_QUALITY);
-    encoder.encode(rgb_buf, width as u16, height as u16, ColorType::Rgb)?;
+    encoder.encode(
+        rgb_buf,
+        encoded_width as u16,
+        encoded_height as u16,
+        ColorType::Rgb,
+    )?;
     Ok(())
 }
 
