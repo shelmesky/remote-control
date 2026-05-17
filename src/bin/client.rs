@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -8,22 +10,33 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use eframe::egui;
-use image::ExtendedColorType;
-use image::codecs::jpeg::JpegEncoder;
-use remote_control::config::{SERVER_TARGET_ADDR, TARGET_FPS};
+use jpeg_encoder::{ColorType, Encoder};
+use remote_control::config::TARGET_FPS;
 use remote_control::protocol::{ClientHello, write_frame, write_hello};
 use remote_control::ui_fonts::install_cjk_font;
 use scrap::{Capturer, Display};
 
 #[cfg(target_os = "windows")]
+use windows_capture::capture::{Context as WgcContext, GraphicsCaptureApiHandler};
+#[cfg(target_os = "windows")]
+use windows_capture::monitor::Monitor;
+#[cfg(target_os = "windows")]
+use windows_capture::settings::{
+    ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+};
+#[cfg(target_os = "windows")]
 use winreg::RegKey;
 #[cfg(target_os = "windows")]
 use winreg::enums::HKEY_CURRENT_USER;
 
+const SERVER_ADDR: &str = "127.0.0.1:5000";
+const JPEG_QUALITY: u8 = 70;
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Remote Monitor Client (Compliant)",
+        "Remote Monitor Client",
         options,
         Box::new(|cc| Ok(Box::new(ClientApp::new(cc)))),
     )
@@ -74,6 +87,7 @@ impl ClientApp {
             if let Err(e) = run_stream_loop(worker_stop, tx.clone()) {
                 let _ = tx.send(ClientEvent::Status(format!("推流线程退出: {e:#}")));
             }
+            let _ = tx.send(ClientEvent::Stopped);
         });
 
         self.stop_signal = Some(stop_signal);
@@ -102,9 +116,7 @@ impl ClientApp {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     ClientEvent::Status(msg) => self.status = msg,
-                    ClientEvent::Stopped => {
-                        should_mark_stopped = true;
-                    }
+                    ClientEvent::Stopped => should_mark_stopped = true,
                 }
             }
         }
@@ -128,10 +140,10 @@ impl eframe::App for ClientApp {
         ctx.request_repaint_after(Duration::from_millis(50));
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("远程桌面共享客户端（合规模式）");
+            ui.heading("远程桌面共享客户端（Windows 优化）");
             ui.separator();
-            ui.label("客户端仅在用户明确授权后推流，且界面持续可见。");
-            ui.label(format!("服务器地址（固定）: {SERVER_TARGET_ADDR}"));
+            ui.label("截图引擎: Windows Graphics Capture (Windows 10/11)");
+            ui.label(format!("服务器地址（硬编码）: {SERVER_ADDR}"));
             ui.separator();
 
             ui.checkbox(
@@ -142,7 +154,7 @@ impl eframe::App for ClientApp {
             let autostart_changed = ui
                 .checkbox(
                     &mut self.autostart_checked,
-                    "开机自动启动客户端（当前用户）",
+                    "开机自动启动客户端（当前用户，注册表 Run）",
                 )
                 .changed();
             if autostart_changed {
@@ -171,18 +183,8 @@ impl eframe::App for ClientApp {
             });
 
             ui.separator();
-            ui.colored_label(
-                if self.sharing {
-                    egui::Color32::LIGHT_GREEN
-                } else {
-                    egui::Color32::LIGHT_RED
-                },
-                format!("状态: {}", self.status),
-            );
+            ui.label(format!("状态: {}", self.status));
             ui.label(&self.font_status);
-            if self.sharing {
-                ui.label("提示：当前正在持续采集桌面并发送到服务端。");
-            }
         });
     }
 }
@@ -194,10 +196,8 @@ enum ClientEvent {
 
 fn run_stream_loop(stop: Arc<AtomicBool>, tx: Sender<ClientEvent>) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        let _ = tx.send(ClientEvent::Status(format!(
-            "连接服务端 {SERVER_TARGET_ADDR} ..."
-        )));
-        match run_stream_session(&stop, &tx) {
+        let _ = tx.send(ClientEvent::Status(format!("连接服务端 {SERVER_ADDR} ...")));
+        match run_stream_session(&stop) {
             Ok(()) => {
                 if !stop.load(Ordering::Relaxed) {
                     let _ = tx.send(ClientEvent::Status("连接已关闭，准备重连...".to_string()));
@@ -211,29 +211,108 @@ fn run_stream_loop(stop: Arc<AtomicBool>, tx: Sender<ClientEvent>) -> Result<()>
             }
         }
     }
-    let _ = tx.send(ClientEvent::Stopped);
     Ok(())
 }
 
-fn run_stream_session(stop: &Arc<AtomicBool>, tx: &Sender<ClientEvent>) -> Result<()> {
-    let mut stream = TcpStream::connect(SERVER_TARGET_ADDR)
-        .with_context(|| format!("connect failed: {SERVER_TARGET_ADDR}"))?;
+#[cfg(target_os = "windows")]
+fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
+    #[derive(Clone)]
+    struct WgcFlags {
+        stop: Arc<AtomicBool>,
+    }
+
+    struct WgcHandler {
+        stop: Arc<AtomicBool>,
+        stream: TcpStream,
+        rgb_buf: Vec<u8>,
+        jpeg_buf: Vec<u8>,
+        rgba_nopad: Vec<u8>,
+    }
+
+    impl GraphicsCaptureApiHandler for WgcHandler {
+        type Flags = WgcFlags;
+        type Error = anyhow::Error;
+
+        fn new(ctx: WgcContext<Self::Flags>) -> std::result::Result<Self, Self::Error> {
+            let mut stream = TcpStream::connect(SERVER_ADDR)
+                .with_context(|| format!("connect failed: {SERVER_ADDR}"))?;
+            stream.set_nodelay(true)?;
+            write_hello(
+                &mut stream,
+                &ClientHello {
+                    client_name: client_name(),
+                },
+            )?;
+
+            Ok(Self {
+                stop: ctx.flags.stop,
+                stream,
+                rgb_buf: Vec::new(),
+                jpeg_buf: Vec::new(),
+                rgba_nopad: Vec::new(),
+            })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut windows_capture::frame::Frame,
+            capture_control: windows_capture::capture::InternalCaptureControl,
+        ) -> std::result::Result<(), Self::Error> {
+            if self.stop.load(Ordering::Relaxed) {
+                let _ = capture_control.stop();
+                return Ok(());
+            }
+
+            let frame_buffer = frame.buffer()?;
+            let width = frame_buffer.width() as usize;
+            let height = frame_buffer.height() as usize;
+
+            let rgba = frame_buffer.as_nopadding_buffer(&mut self.rgba_nopad);
+            encode_jpeg_rgba_reuse(rgba, width, height, &mut self.rgb_buf, &mut self.jpeg_buf)?;
+            write_frame(&mut self.stream, &self.jpeg_buf)?;
+            Ok(())
+        }
+    }
+
+    let monitor = Monitor::primary()?;
+    let settings = Settings::new(
+        monitor,
+        CursorCaptureSettings::Default,
+        DrawBorderSettings::Default,
+        SecondaryWindowSettings::Default,
+        MinimumUpdateIntervalSettings::Milliseconds((1000 / TARGET_FPS).max(1) as i32),
+        DirtyRegionSettings::Default,
+        ColorFormat::Rgba8,
+        WgcFlags {
+            stop: Arc::clone(stop),
+        },
+    );
+
+    WgcHandler::start(settings)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
+    let mut stream = TcpStream::connect(SERVER_ADDR)
+        .with_context(|| format!("connect failed: {SERVER_ADDR}"))?;
     stream.set_nodelay(true)?;
 
-    let client_name = format!(
-        "{}@{}",
-        std::env::var("USERNAME").unwrap_or_else(|_| "unknown-user".to_string()),
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown-host".to_string())
-    );
-    write_hello(&mut stream, &ClientHello { client_name })?;
-    let _ = tx.send(ClientEvent::Status("已连接，开始推流".to_string()));
+    write_hello(
+        &mut stream,
+        &ClientHello {
+            client_name: client_name(),
+        },
+    )?;
 
     let display = Display::primary().context("unable to get primary display")?;
     let mut capturer = Capturer::new(display).context("unable to create screen capturer")?;
     let width = capturer.width();
     let height = capturer.height();
-
     let frame_interval = Duration::from_millis((1000 / TARGET_FPS).max(1));
+
+    let mut rgb_buf = vec![0_u8; width * height * 3];
+    let mut jpeg_buf = Vec::with_capacity(width * height / 3);
 
     while !stop.load(Ordering::Relaxed) {
         let tick = Instant::now();
@@ -249,9 +328,8 @@ fn run_stream_session(stop: &Arc<AtomicBool>, tx: &Sender<ClientEvent>) -> Resul
                 Err(e) => return Err(e).context("capture frame failed"),
             }
         };
-
-        let jpeg = encode_jpeg_bgra(&frame, width, height).context("jpeg encode failed")?;
-        write_frame(&mut stream, &jpeg).context("send frame failed")?;
+        encode_jpeg_bgra_reuse(&frame, width, height, &mut rgb_buf, &mut jpeg_buf)?;
+        write_frame(&mut stream, &jpeg_buf).context("send frame failed")?;
 
         let elapsed = tick.elapsed();
         if elapsed < frame_interval {
@@ -261,8 +339,38 @@ fn run_stream_session(stop: &Arc<AtomicBool>, tx: &Sender<ClientEvent>) -> Resul
     Ok(())
 }
 
-fn encode_jpeg_bgra(frame: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
-    if height == 0 || width == 0 {
+#[cfg(target_os = "windows")]
+fn encode_jpeg_rgba_reuse(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    rgb_buf: &mut Vec<u8>,
+    jpeg_buf: &mut Vec<u8>,
+) -> Result<()> {
+    if rgba.len() < width * height * 4 {
+        bail!("invalid rgba frame size");
+    }
+
+    rgb_buf.clear();
+    rgb_buf.reserve(width * height * 3);
+    for px in rgba.chunks_exact(4) {
+        rgb_buf.extend_from_slice(&[px[0], px[1], px[2]]);
+    }
+
+    jpeg_buf.clear();
+    let encoder = Encoder::new(jpeg_buf, JPEG_QUALITY);
+    encoder.encode(rgb_buf, width as u16, height as u16, ColorType::Rgb)?;
+    Ok(())
+}
+
+fn encode_jpeg_bgra_reuse(
+    frame: &[u8],
+    width: usize,
+    height: usize,
+    rgb_buf: &mut Vec<u8>,
+    jpeg_buf: &mut Vec<u8>,
+) -> Result<()> {
+    if width == 0 || height == 0 {
         bail!("invalid screen size");
     }
     let stride = frame.len() / height;
@@ -270,18 +378,29 @@ fn encode_jpeg_bgra(frame: &[u8], width: usize, height: usize) -> Result<Vec<u8>
         bail!("unexpected frame stride");
     }
 
-    let mut rgb = Vec::with_capacity(width * height * 3);
+    rgb_buf.clear();
+    rgb_buf.reserve(width * height * 3);
     for y in 0..height {
         let row = &frame[y * stride..(y * stride + width * 4)];
         for px in row.chunks_exact(4) {
-            rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+            rgb_buf.extend_from_slice(&[px[2], px[1], px[0]]);
         }
     }
 
-    let mut out = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut out, 70);
-    encoder.encode(&rgb, width as u32, height as u32, ExtendedColorType::Rgb8)?;
-    Ok(out)
+    jpeg_buf.clear();
+    let encoder = Encoder::new(jpeg_buf, JPEG_QUALITY);
+    encoder.encode(rgb_buf, width as u16, height as u16, ColorType::Rgb)?;
+    Ok(())
+}
+
+fn client_name() -> String {
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown-user".to_string());
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    format!("{user}@{host}")
 }
 
 #[cfg(target_os = "windows")]
@@ -289,11 +408,9 @@ fn set_autostart_enabled(enabled: bool) -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (run_key, _) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
     const VALUE_NAME: &str = "RemoteMonitorClientCompliant";
-
     if enabled {
         let exe = std::env::current_exe().context("current_exe failed")?;
-        let value = exe.to_string_lossy().to_string();
-        run_key.set_value(VALUE_NAME, &value)?;
+        run_key.set_value(VALUE_NAME, &exe.to_string_lossy().to_string())?;
     } else {
         let _ = run_key.delete_value(VALUE_NAME);
     }

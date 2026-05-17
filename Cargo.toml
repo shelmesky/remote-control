@@ -8,7 +8,15 @@ anyhow = "1.0"
 eframe = "0.29"
 egui = "0.29"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+jpeg-encoder = "0.7"
 scrap = "0.5"
 
 [target.'cfg(windows)'.dependencies]
+windows-capture = "2.0"
 winreg = "0.52"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
