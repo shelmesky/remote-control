@@ -121,17 +121,15 @@ fn overlay_cursor(rgb: &mut [u8], width: usize, height: usize) {
     };
     let x = cursor.x.div_euclid(SCALE_DIVISOR as i32);
     let y = cursor.y.div_euclid(SCALE_DIVISOR as i32);
-    draw_cursor_pixel(rgb, width, height, x, y, [255, 255, 255]);
-    draw_cursor_pixel(rgb, width, height, x + 1, y, [0, 0, 0]);
-    draw_cursor_pixel(rgb, width, height, x, y + 1, [0, 0, 0]);
-    for i in 0..18 {
-        let dx = i / 2;
-        draw_cursor_pixel(rgb, width, height, x + dx, y + i, [255, 255, 255]);
-        draw_cursor_pixel(rgb, width, height, x + dx + 1, y + i, [0, 0, 0]);
-    }
-    for i in 0..10 {
-        draw_cursor_pixel(rgb, width, height, x + i, y + i + 10, [255, 255, 255]);
-        draw_cursor_pixel(rgb, width, height, x + i + 1, y + i + 10, [0, 0, 0]);
+    const CURSOR_DOT_RADIUS: i32 = 9;
+    const CURSOR_DOT_COLOR: [u8; 3] = [255, 0, 0];
+
+    for dy in -CURSOR_DOT_RADIUS..=CURSOR_DOT_RADIUS {
+        for dx in -CURSOR_DOT_RADIUS..=CURSOR_DOT_RADIUS {
+            if dx * dx + dy * dy <= CURSOR_DOT_RADIUS * CURSOR_DOT_RADIUS {
+                draw_cursor_pixel(rgb, width, height, x + dx, y + dy, CURSOR_DOT_COLOR);
+            }
+        }
     }
 }
 
