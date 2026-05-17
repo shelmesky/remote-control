@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use eframe::egui;
 use jpeg_encoder::{ColorType, Encoder};
-use remote_control::config::TARGET_FPS;
+use remote_control::config::{CLIENT_SERVER_ADDR, TARGET_FPS};
 use remote_control::protocol::{ClientHello, write_frame, write_hello};
 use remote_control::ui_fonts::install_cjk_font;
 #[cfg(not(target_os = "windows"))]
@@ -34,7 +34,6 @@ use winreg::RegKey;
 #[cfg(target_os = "windows")]
 use winreg::enums::HKEY_CURRENT_USER;
 
-const SERVER_ADDR: &str = "172.20.20.8:5000";
 const JPEG_QUALITY: u8 = 45;
 const SCALE_DIVISOR: usize = 2;
 
@@ -148,7 +147,7 @@ impl eframe::App for ClientApp {
             ui.heading("远程桌面共享客户端（Windows 优化）");
             ui.separator();
             ui.label("截图引擎: Windows Graphics Capture (Windows 10/11)");
-            ui.label(format!("服务器地址（硬编码）: {SERVER_ADDR}"));
+            ui.label(format!("服务器地址（硬编码）: {CLIENT_SERVER_ADDR}"));
             ui.separator();
 
             ui.checkbox(
@@ -201,7 +200,9 @@ enum ClientEvent {
 
 fn run_stream_loop(stop: Arc<AtomicBool>, tx: Sender<ClientEvent>) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        let _ = tx.send(ClientEvent::Status(format!("连接服务端 {SERVER_ADDR} ...")));
+        let _ = tx.send(ClientEvent::Status(format!(
+            "连接服务端 {CLIENT_SERVER_ADDR} ..."
+        )));
         match run_stream_session(&stop) {
             Ok(()) => {
                 if !stop.load(Ordering::Relaxed) {
@@ -241,8 +242,8 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
         type Error = anyhow::Error;
 
         fn new(ctx: WgcContext<Self::Flags>) -> std::result::Result<Self, Self::Error> {
-            let mut stream = TcpStream::connect(SERVER_ADDR)
-                .with_context(|| format!("connect failed: {SERVER_ADDR}"))?;
+            let mut stream = TcpStream::connect(CLIENT_SERVER_ADDR)
+                .with_context(|| format!("connect failed: {CLIENT_SERVER_ADDR}"))?;
             stream.set_nodelay(true)?;
             write_hello(
                 &mut stream,
@@ -309,8 +310,8 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
-    let mut stream = TcpStream::connect(SERVER_ADDR)
-        .with_context(|| format!("connect failed: {SERVER_ADDR}"))?;
+    let mut stream = TcpStream::connect(CLIENT_SERVER_ADDR)
+        .with_context(|| format!("connect failed: {CLIENT_SERVER_ADDR}"))?;
     stream.set_nodelay(true)?;
 
     write_hello(
