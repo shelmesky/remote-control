@@ -106,6 +106,11 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
+fn run_stream_session(_stop: &Arc<AtomicBool>) -> Result<()> {
+    bail!("desktop sharing is only supported on Windows");
+}
+
 fn encode_jpeg_bgra_reuse(
     frame: &[u8],
     width: usize,
