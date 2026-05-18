@@ -26,7 +26,7 @@ use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
 const JPEG_QUALITY: u8 = 45;
-const SCALE_DIVISOR: usize = 2;
+const SCALE_DIVISOR: usize = 1;
 const SINGLE_INSTANCE_NAME: &str = "RemoteMonitorClient";
 const STARTUP_TASK_NAME: &str = "RemoteMonitorClientSystemStartup";
 #[cfg(target_os = "windows")]
