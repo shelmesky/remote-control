@@ -3,10 +3,14 @@
 use anyhow::{Context, Result, bail};
 use jpeg_encoder::{ColorType, Encoder};
 use remote_control::config::{CLIENT_SERVER_ADDR, TARGET_FPS};
-use remote_control::platform::{cursor_position, enable_dpi_awareness};
+use remote_control::platform::{
+    acquire_single_instance, cursor_position, enable_dpi_awareness,
+    set_interactive_user_startup_task, startup_task_exists,
+};
 use remote_control::protocol::{ClientHello, write_frame, write_hello};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind;
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,17 +22,38 @@ use winreg::RegKey;
 #[cfg(target_os = "windows")]
 use winreg::enums::HKEY_CURRENT_USER;
 
-const JPEG_QUALITY: u8 = 45;
+const JPEG_QUALITY: u8 = 90;
 const SCALE_DIVISOR: usize = 2;
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const SINGLE_INSTANCE_NAME: &str = "RemoteMonitorClient";
+const STARTUP_TASK_NAME: &str = "RemoteMonitorClientSystemStartup";
+#[cfg(target_os = "windows")]
+const REGISTRY_VALUE_NAME: &str = "RemoteMonitorClientHeadless";
 
 fn main() {
     enable_dpi_awareness();
-    let _ = set_autostart_enabled();
+    log_headless_event("process started");
+
+    let Some(_instance_guard) = acquire_single_instance(SINGLE_INSTANCE_NAME) else {
+        log_headless_event("another client instance is already running; exiting");
+        return;
+    };
+
+    if let Err(e) = set_autostart_enabled() {
+        log_headless_event(&format!("set autostart failed: {e:#}"));
+    }
+    if let Err(e) = set_registry_autostart_enabled() {
+        log_headless_event(&format!("set registry autostart failed: {e:#}"));
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
 
     while !stop.load(Ordering::Relaxed) {
-        if run_stream_session(&stop).is_err() {
+        match run_stream_session(&stop) {
+            Ok(()) => log_headless_event("stream session ended"),
+            Err(e) => log_headless_event(&format!("stream session failed: {e:#}")),
+        }
+        if !stop.load(Ordering::Relaxed) {
             thread::sleep(RECONNECT_DELAY);
         }
     }
@@ -36,6 +61,7 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
+    log_headless_event(&format!("connecting to {CLIENT_SERVER_ADDR}"));
     let mut stream = TcpStream::connect(CLIENT_SERVER_ADDR)
         .with_context(|| format!("connect failed: {CLIENT_SERVER_ADDR}"))?;
     stream.set_nodelay(true)?;
@@ -45,6 +71,7 @@ fn run_stream_session(stop: &Arc<AtomicBool>) -> Result<()> {
             client_name: client_name(),
         },
     )?;
+    log_headless_event("connected and hello sent");
 
     let display = Display::primary().context("unable to get primary display")?;
     let mut capturer = Capturer::new(display).context("unable to create screen capturer")?;
@@ -184,19 +211,55 @@ fn client_name() -> String {
     format!("{user}@{host}")
 }
 
+fn log_headless_event(message: &str) {
+    let log_dir = std::env::var_os("PROGRAMDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"))
+        .join("RemoteControl");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("client_headless.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|_| "unknown-time".to_string());
+        let _ = writeln!(file, "[{timestamp}] {message}");
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn set_autostart_enabled() -> Result<()> {
+    if startup_task_exists(STARTUP_TASK_NAME).unwrap_or(false) {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("current_exe failed")?;
+    set_interactive_user_startup_task(STARTUP_TASK_NAME, &exe)
+        .context("create current-user scheduled task failed")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_autostart_enabled() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn set_registry_autostart_enabled() -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (run_key, _) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
     let exe = std::env::current_exe().context("current_exe failed")?;
     run_key.set_value(
-        "RemoteMonitorClientHeadless",
+        REGISTRY_VALUE_NAME,
         &format!("\"{}\"", exe.to_string_lossy()),
     )?;
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-fn set_autostart_enabled() -> Result<()> {
+fn set_registry_autostart_enabled() -> Result<()> {
     Ok(())
 }

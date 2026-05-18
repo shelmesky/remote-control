@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use eframe::egui;
 use jpeg_encoder::{ColorType, Encoder};
 use remote_control::config::{CLIENT_SERVER_ADDR, TARGET_FPS};
-use remote_control::platform::{cursor_position, enable_dpi_awareness};
+use remote_control::platform::{
+    acquire_single_instance, cursor_position, delete_startup_task, enable_dpi_awareness,
+    set_interactive_user_startup_task, startup_task_exists,
+};
 use remote_control::protocol::{ClientHello, write_frame, write_hello};
 use remote_control::ui_fonts::install_cjk_font;
 use scrap::{Capturer, Display};
@@ -24,9 +27,16 @@ use winreg::enums::HKEY_CURRENT_USER;
 
 const JPEG_QUALITY: u8 = 45;
 const SCALE_DIVISOR: usize = 2;
+const SINGLE_INSTANCE_NAME: &str = "RemoteMonitorClient";
+const STARTUP_TASK_NAME: &str = "RemoteMonitorClientSystemStartup";
+#[cfg(target_os = "windows")]
+const REGISTRY_VALUE_NAME: &str = "RemoteMonitorClientCompliant";
 
 fn main() -> eframe::Result<()> {
     enable_dpi_awareness();
+    let Some(_instance_guard) = acquire_single_instance(SINGLE_INSTANCE_NAME) else {
+        return Ok(());
+    };
 
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -38,7 +48,8 @@ fn main() -> eframe::Result<()> {
 
 struct ClientApp {
     consent_checked: bool,
-    autostart_checked: bool,
+    scheduled_task_checked: bool,
+    registry_autostart_checked: bool,
     sharing: bool,
     status: String,
     stop_signal: Option<Arc<AtomicBool>>,
@@ -55,7 +66,8 @@ impl ClientApp {
         };
         Self {
             consent_checked: false,
-            autostart_checked: get_autostart_enabled().unwrap_or(false),
+            scheduled_task_checked: get_scheduled_task_enabled().unwrap_or(false),
+            registry_autostart_checked: get_registry_autostart_enabled().unwrap_or(false),
             sharing: false,
             status: "未开始共享".to_string(),
             stop_signal: None,
@@ -145,18 +157,35 @@ impl eframe::App for ClientApp {
                 "我已获得当前设备使用者授权，同意开始桌面共享",
             );
 
-            let autostart_changed = ui
+            let scheduled_task_changed = ui
                 .checkbox(
-                    &mut self.autostart_checked,
-                    "开机自动启动客户端（当前用户，注册表 Run）",
+                    &mut self.scheduled_task_checked,
+                    "每 1 分钟检查启动客户端（当前用户计划任务）",
                 )
                 .changed();
-            if autostart_changed {
-                match set_autostart_enabled(self.autostart_checked) {
+            if scheduled_task_changed {
+                match set_scheduled_task_enabled(self.scheduled_task_checked) {
                     Ok(()) => {}
                     Err(e) => {
-                        self.status = format!("设置开机启动失败: {e:#}");
-                        self.autostart_checked = get_autostart_enabled().unwrap_or(false);
+                        self.status = format!("设置计划任务启动失败: {e:#}");
+                        self.scheduled_task_checked = get_scheduled_task_enabled().unwrap_or(false);
+                    }
+                }
+            }
+
+            let registry_autostart_changed = ui
+                .checkbox(
+                    &mut self.registry_autostart_checked,
+                    "登录时启动客户端（当前用户注册表 Run）",
+                )
+                .changed();
+            if registry_autostart_changed {
+                match set_registry_autostart_enabled(self.registry_autostart_checked) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.status = format!("设置注册表启动失败: {e:#}");
+                        self.registry_autostart_checked =
+                            get_registry_autostart_enabled().unwrap_or(false);
                     }
                 }
             }
@@ -367,35 +396,81 @@ fn client_name() -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn set_autostart_enabled(enabled: bool) -> Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (run_key, _) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
-    const VALUE_NAME: &str = "RemoteMonitorClientCompliant";
+fn set_scheduled_task_enabled(enabled: bool) -> Result<()> {
     if enabled {
-        let exe = std::env::current_exe().context("current_exe failed")?;
-        run_key.set_value(VALUE_NAME, &exe.to_string_lossy().to_string())?;
+        let exe = client_headless_exe_path().context("resolve client_headless.exe failed")?;
+        if !exe.exists() {
+            bail!("client_headless.exe not found: {}", exe.display());
+        }
+        set_interactive_user_startup_task(STARTUP_TASK_NAME, &exe)
+            .context("create current-user scheduled task failed")?;
     } else {
-        let _ = run_key.delete_value(VALUE_NAME);
+        if let Err(e) = delete_startup_task(STARTUP_TASK_NAME) {
+            if startup_task_exists(STARTUP_TASK_NAME).unwrap_or(false) {
+                return Err(e).context("delete scheduled task failed");
+            }
+        }
     }
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn client_headless_exe_path() -> Result<std::path::PathBuf> {
+    let mut exe = std::env::current_exe().context("current_exe failed")?;
+    exe.set_file_name("client_headless.exe");
+    Ok(exe)
+}
+
 #[cfg(not(target_os = "windows"))]
-fn set_autostart_enabled(_enabled: bool) -> Result<()> {
+fn set_scheduled_task_enabled(_enabled: bool) -> Result<()> {
     bail!("autostart is only supported on Windows");
 }
 
 #[cfg(target_os = "windows")]
-fn get_autostart_enabled() -> Result<bool> {
+fn get_scheduled_task_enabled() -> Result<bool> {
+    startup_task_exists(STARTUP_TASK_NAME).context("query scheduled task failed")
+}
+
+#[cfg(target_os = "windows")]
+fn set_registry_autostart_enabled(enabled: bool) -> Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (run_key, _) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
+    if enabled {
+        let exe = client_headless_exe_path().context("resolve client_headless.exe failed")?;
+        if !exe.exists() {
+            bail!("client_headless.exe not found: {}", exe.display());
+        }
+        run_key.set_value(
+            REGISTRY_VALUE_NAME,
+            &format!("\"{}\"", exe.to_string_lossy()),
+        )?;
+    } else {
+        let _ = run_key.delete_value(REGISTRY_VALUE_NAME);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn get_registry_autostart_enabled() -> Result<bool> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let run_key = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
-    const VALUE_NAME: &str = "RemoteMonitorClientCompliant";
-    let value: String = run_key.get_value(VALUE_NAME)?;
-    let exe = std::env::current_exe().context("current_exe failed")?;
-    Ok(value.eq_ignore_ascii_case(&exe.to_string_lossy()))
+    let value: String = run_key.get_value(REGISTRY_VALUE_NAME)?;
+    let exe = client_headless_exe_path().context("resolve client_headless.exe failed")?;
+    let normalized_value = value.trim().trim_matches('"');
+    Ok(normalized_value.eq_ignore_ascii_case(&exe.to_string_lossy()))
 }
 
 #[cfg(not(target_os = "windows"))]
-fn get_autostart_enabled() -> Result<bool> {
+fn get_scheduled_task_enabled() -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_registry_autostart_enabled(_enabled: bool) -> Result<()> {
+    bail!("registry autostart is only supported on Windows");
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_registry_autostart_enabled() -> Result<bool> {
     Ok(false)
 }
